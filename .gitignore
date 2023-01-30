@@ -1,2 +1,3 @@
 __pycache__
 embeddings/.ipynb_checkpoints
+embeddings/embeddings.db
