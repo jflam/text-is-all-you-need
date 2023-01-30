@@ -1,10 +1,9 @@
-import sqlite_utils
-import struct
+import pickle
 import time
-from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain import FAISS
 
-# Split on double newlines or 1000 characters, whichever comes first
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size = 500,
     chunk_overlap = 50,
@@ -13,45 +12,31 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 EMBEDDING_MODEL = "sentence-transformers/gtr-t5-large"
 INPUT_FILE = "avg.txt"
-OUTPUT_FILE = "embeddings.db"
-EMBEDDING_TABLE = "embeddings"
+INDEX_FILE = "index.pkl"
+MAPPING_FILE = "mappings.pkl"
+DOCUMENTS_FILE = "documents.pkl"
 
-print("Loading file...")
+print(f"Loading {INPUT_FILE}...")
 with open(INPUT_FILE) as f:
     lines = f.readlines()
 
 doc = "".join(lines)
 texts = text_splitter.split_text(doc)
 
-print("Loading embedding model...")
-model = SentenceTransformer(EMBEDDING_MODEL)
+print(f"Loading embedding model {EMBEDDING_MODEL}...")
+model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
+print("Computing embeddings...")
 start = time.perf_counter()
-embeddings = model.encode(texts)
-end = time.perf_counter() - start
+db = FAISS.from_texts(texts, model)
+db.save_local(INDEX_FILE)
 
-print(f"Generated {len(embeddings)} embeddings in {end:.2f} seconds")
-print(embeddings.shape)
+with open(MAPPING_FILE, "wb") as f:
+    pickle.dump(db.index_to_docstore_id, f)
 
-print("Saving to database...")
+with open(DOCUMENTS_FILE, "wb") as f:
+    pickle.dump(db.docstore, f)
 
-# Save the embedding and the original text used to generate the embedding
-start = time.perf_counter()
-db = sqlite_utils.Database(OUTPUT_FILE)
-table = db[EMBEDDING_TABLE]
-if not table.exists():
-    table.create({
-        "embedding": bytes,
-        "text": str
-    })
-
-assert len(texts) == len(embeddings)
-
-for text, embedding in zip(texts, embeddings):
-    table.insert({
-        "embedding": struct.pack("f" * 768, *embedding), 
-        "text": text}, replace=True)
-
-db.close()
-end = time.perf_counter() - start
-print(f"Saved {len(embeddings)} embeddings to {OUTPUT_FILE} in {end:.2f} seconds")
+elapsed = time.perf_counter() - start
+print(f"Saved embeddings to {INDEX_FILE}, {MAPPING_FILE}, {DOCUMENTS_FILE} "
+    f"in {elapsed:.2f} seconds")

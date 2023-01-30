@@ -1,3 +1,5 @@
 __pycache__
 embeddings/.ipynb_checkpoints
-embeddings/embeddings.db
+embeddings/index.pkl
+embeddings/mappings.pkl
+embeddings/documents.pkl
