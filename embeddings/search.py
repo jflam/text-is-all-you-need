@@ -8,7 +8,9 @@ from langchain.llms import AzureOpenAI
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain import FAISS
 
-"""## DeepMemory Search"""
+"""
+## Deep Questions
+(with apologies to Cal Newport)"""
 
 EMBEDDING_MODEL = "sentence-transformers/gtr-t5-large"
 INDEX_FILE = "index.pkl"
@@ -58,7 +60,7 @@ if "model" not in st.session_state:
 
     st.session_state.db = db
 
-query = st.text_input("Enter a search query")
+query = st.text_input("Enter a question")
 if query:
     results = st.session_state.db.similarity_search(query, k=TOP_K)
     context = ""
