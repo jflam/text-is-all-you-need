@@ -1,5 +1,7 @@
 faiss-cpu
 langchain
 openai
+sentence_transformers
 streamlit
 streamlit-chat
+watchdog
