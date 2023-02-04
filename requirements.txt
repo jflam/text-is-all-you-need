@@ -1,6 +1,7 @@
 faiss-cpu
 langchain
 openai
+pypdf2
 sentence_transformers
 streamlit
 streamlit-chat
