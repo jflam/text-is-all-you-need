@@ -3,10 +3,9 @@ import openai
 import os
 import pickle
 import streamlit as st
-from langchain.prompts import PromptTemplate
-from langchain.llms import AzureOpenAI
 from langchain.embeddings import HuggingFaceEmbeddings
-from langchain import FAISS
+from langchain.llms import AzureOpenAI
+from langchain import VectorDBQA, FAISS
 
 """
 ## Deep Questions
@@ -26,20 +25,10 @@ DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
 
 llm = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
     openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-    model_name="text-davinci-003", temperature=0)
+    model_name="text-davinci-003", temperature=0.0, max_tokens=1000)
 
 def evaluate_prompt(prompt: str) -> str:
     return llm(prompt)
-
-template = PromptTemplate(
-    input_variables=["user_question", "context"],
-    template="""
-The following is a question from the user: {user_question} 
-
-Please answer the question using the context below:
-{context}
-"""
-)
 
 if "model" not in st.session_state:
     model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
@@ -62,17 +51,10 @@ if "model" not in st.session_state:
 
 query = st.text_input("Enter a question")
 if query:
-    results = st.session_state.db.similarity_search(query, k=TOP_K)
-    context = ""
-    for result in results:
-        context += result.page_content
-        context += "\n\n- - - - - - -\n\n"
-    
-    prompt = template.format(context=context, user_question=query)
-    with st.expander("Show query"):
-        st.write(prompt)
+    qa = VectorDBQA.from_chain_type(llm=llm, chain_type="refine", 
+                                    vectorstore=st.session_state.db)
 
     with st.spinner("Waiting for OpenAI to respond..."):
-        response = evaluate_prompt(prompt)
+        response = qa.run(query)
     
     st.write(response)
