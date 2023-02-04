@@ -6,6 +6,7 @@ import streamlit as st
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.llms import AzureOpenAI
 from langchain import VectorDBQA, FAISS
+from streamlit_chat import message
 
 """
 ## Deep Questions
@@ -48,6 +49,8 @@ if "model" not in st.session_state:
         index_to_docstore_id=index_to_docstore_id)
 
     st.session_state.db = db
+    st.session_state.past = []
+    st.session_state.generated = []
 
 query = st.text_input("Enter a question")
 if query:
@@ -56,5 +59,10 @@ if query:
 
     with st.spinner("Waiting for OpenAI to respond..."):
         response = qa.run(query)
+        st.session_state.past.append(query)
+        st.session_state.generated.append(response)
     
-    st.write(response)
+    if 'generated' in st.session_state:
+        for i in range(len(st.session_state.generated)-1, -1, -1):
+            message(st.session_state.generated[i], key=str(i))
+            message(st.session_state.past[i], is_user=True, key=str(i) + "_user")
