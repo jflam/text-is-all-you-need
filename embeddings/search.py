@@ -1,5 +1,6 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["LANGCHAIN_HANDLER"] = "langchain"
 
 import faiss
 import openai
@@ -20,6 +21,7 @@ INDEX_FILE = "index.pkl"
 MAPPING_FILE = "mappings.pkl"
 DOCUMENTS_FILE = "documents.pkl"
 TOP_K = 10
+USE_HYDE = False
 
 ENVIRONMENT="EAST_AZURE_OPENAI"
 openai.api_base = os.environ[f"{ENVIRONMENT}_ENDPOINT"]
@@ -27,7 +29,7 @@ openai.api_type = "azure"
 openai.api_version = "2022-12-01"
 DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
 
-def read_index(base_embeddings) -> FAISS:
+def read_index(embeddings) -> FAISS:
     index = faiss.read_index(INDEX_FILE)
 
     with open(MAPPING_FILE, "rb") as f:
@@ -36,19 +38,25 @@ def read_index(base_embeddings) -> FAISS:
     with open(DOCUMENTS_FILE, "rb") as f:
         docstore = pickle.load(f)
     
-    return FAISS(base_embeddings.embed_query, 
+    return FAISS(embeddings.embed_query, 
         index, 
         docstore=docstore, 
         index_to_docstore_id=index_to_docstore_id)
 
 if "db" not in st.session_state:
-    base_embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    st.session_state.db = read_index(base_embeddings)
-
     llm = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
         openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-        model_name="text-davinci-003", temperature=0.0, max_tokens=1000)
-    qa = VectorDBQA.from_chain_type(llm=llm, chain_type="stuff", k=10, 
+        model_name="text-davinci-003", temperature=0.0, max_tokens=1000,
+        n=4, best_of=4)
+    base_embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    if USE_HYDE:
+        embeddings = HypotheticalDocumentEmbedder.from_llm(llm=llm, 
+            base_embeddings=base_embeddings, prompt_key="web_search")
+        st.session_state.db = read_index(embeddings)
+    else:
+        st.session_state.db = read_index(base_embeddings)
+
+    qa = VectorDBQA.from_chain_type(llm=llm, chain_type="stuff", k=TOP_K, 
                                     vectorstore=st.session_state.db,
                                     return_source_documents=True)
     st.session_state.qa = qa
