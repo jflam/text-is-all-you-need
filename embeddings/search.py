@@ -5,6 +5,7 @@ import faiss
 import openai
 import pickle
 import streamlit as st
+from langchain.chains import HypotheticalDocumentEmbedder
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.llms import AzureOpenAI
 from langchain import VectorDBQA, FAISS
@@ -26,10 +27,6 @@ openai.api_type = "azure"
 openai.api_version = "2022-12-01"
 DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
 
-llm = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
-    openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-    model_name="text-davinci-003", temperature=0.0, max_tokens=1000)
-
 def read_index(base_embeddings) -> FAISS:
     index = faiss.read_index(INDEX_FILE)
 
@@ -47,21 +44,24 @@ def read_index(base_embeddings) -> FAISS:
 if "db" not in st.session_state:
     base_embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
     st.session_state.db = read_index(base_embeddings)
+
+    llm = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
+        openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
+        model_name="text-davinci-003", temperature=0.0, max_tokens=1000)
+    qa = VectorDBQA.from_chain_type(llm=llm, chain_type="stuff", k=10, 
+                                    vectorstore=st.session_state.db,
+                                    return_source_documents=True)
+    st.session_state.qa = qa
     st.session_state.past = []
     st.session_state.generated = []
     st.session_state.sources = []
 
 query = st.text_input("Enter a question")
 if query:
-    qa = VectorDBQA.from_chain_type(llm=llm, chain_type="stuff", k=10, 
-                                    vectorstore=st.session_state.db,
-                                    return_source_documents=True)
-    
     with st.spinner("Waiting for OpenAI to respond..."):
-        result = qa({"query": query})
-        answer = result["result"]
+        result = st.session_state.qa({"query": query})
         st.session_state.past.append(query)
-        st.session_state.generated.append(answer)
+        st.session_state.generated.append(result["result"])
         st.session_state.sources.append(result["source_documents"])
     
     if 'generated' in st.session_state:
