@@ -1,8 +1,12 @@
 faiss-cpu
-langchain
+langchain>=0.0.70
+modal-client
 openai
+protobuf<3.20.0
 pypdf2
+qdrant-client==0.11.9
 sentence_transformers
 streamlit
 streamlit-chat
+st-annotated-text
 watchdog

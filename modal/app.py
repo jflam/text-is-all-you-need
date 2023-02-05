@@ -12,7 +12,7 @@ LOCAL_FILE="bible.txt"
 EMBEDDING_MODEL="sentence-transformers/gtr-t5-large"
 
 # This is the volume that is used to cache the model files. The 
-# model used, gtr-t5-large is ~700MB, so it's a good idea to cache it.
+# model used, gtr-t5-large is ~644MB, so it's a good idea to cache it.
 # You will see the model downloaded on first execution only.
 volume = modal.SharedVolume().persist("transformer-cache")
 
@@ -46,7 +46,7 @@ def main():
         text = f.read()
 
     start = time.perf_counter()
-    result = remote.call(text)
+    result = remote.call(text) # run remotely
     end = time.perf_counter()
 
     print(f"Elapsed time: {end - start:.2f} seconds")
