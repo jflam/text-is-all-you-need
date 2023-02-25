@@ -1,9 +1,15 @@
-import json, openai, os, re, tiktoken
+import hashlib, json, openai, os, pickle, re, tiktoken
 from langchain.prompts.few_shot import FewShotPromptTemplate
 from langchain.prompts.prompt import PromptTemplate
 from langchain.document_loaders import TextLoader
-from langchain.text_splitter import NLTKTextSplitter
+from langchain.text_splitter import NLTKTextSplitter, TextSplitter, TokenTextSplitter
 from langchain.llms import AzureOpenAI
+from langchain.docstore.document import Document
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.embeddings.base import Embeddings
+from langchain.llms.base import BaseLLM
+
+from textual.app import App
 
 ENVIRONMENT="EAST_AZURE_OPENAI"
 openai.api_base = os.environ[f"{ENVIRONMENT}_ENDPOINT"]
@@ -11,7 +17,9 @@ openai.api_type = "azure"
 openai.api_version = "2022-12-01"
 DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
 
-MODEL_NAME = "text-davinci-003"
+EMBEDDING_MODEL = "sentence-transformers/gtr-t5-large"
+LLM_MODEL = "text-davinci-003"
+MAX_TOKENS = 4096
 
 # I like the dedent concept - this is copied from summ
 def dedent(text: str) -> str:
@@ -19,11 +27,13 @@ def dedent(text: str) -> str:
     return "\n".join(map(str.strip, text.splitlines())).strip()
 
 def compute_token_count(doc: str) -> int:
-    enc = tiktoken.encoding_for_model(MODEL_NAME)
+    enc = tiktoken.encoding_for_model(LLM_MODEL)
     tokens = enc.encode(doc)
     return len(tokens) 
 
 # Parse the results into context and facts
+# TODO: Not going to need this once I refactor the code to ask the LLM to
+# generate JSON as its response for the factify part.
 def parse_list(results: list[str], prefix: str = ""):
     return [
         g.strip()
@@ -47,6 +57,8 @@ def extract_facts_and_context_from_result(result: str):
 DEFAULT_CONTEXT = "This is the start of the conversation."
 
 # Few shot examples for factifier
+# TODO: update this to be more relevant to non-interview tasks (might not
+# matter either)
 FEW_SHOT_EXAMPLES = [
     {
         "context": ("The conversation so far has covered the backround of "
@@ -110,15 +122,15 @@ factify_template = FewShotPromptTemplate(
     input_variables=["context", "chunk"],
     prefix=dedent(
         """ 
-        Your task is to take the context of a conversation, and a
-        paragraph, and extract any pertinent facts from it. The facts
-        should only cover new information introduced in the paragraph. The
-        context is only for background; do not use it to generate facts.
+        Your task is to take the context of document and a chunk of text, and
+        extract any pertinent facts from it. The facts should only cover new
+        information introduced in the chunk. The context is only for
+        background; do not use it to generate facts.
 
-        You will also generate a new context, by taking the old context
-        and modifying it if needed to account for the additional
-        paragraph. You do not need to change the old context if it is
-        suitable; simply return it again.
+        You will also generate a new context, by taking the old context and
+        modifying it if needed to account for the additional chunk. You do not
+        need to change the old context if it is suitable; simply return it
+        again.
 
         Here is an example:
         """
@@ -127,50 +139,20 @@ factify_template = FewShotPromptTemplate(
         """ 
         Now the real one:
 
-        ---
         Context:
         {context}
 
         Paragraph:
         {chunk}
 
-        Facts:
-        -
+        Return your response as JSON:
+        {{
+            "facts": ["fact 1", "fact 2", ...],
+            "context": "new context"
+        }}
         """
     )
 )
-
-# Read document into a string
-loader = TextLoader("ch1.txt")
-doc = loader.load()
-
-splitter = NLTKTextSplitter(chunk_size=8000)
-docs = splitter.split_documents(doc)
-
-context = DEFAULT_CONTEXT
-chunk = docs[0].page_content
-prompt = factify_template.format(context=context, chunk=chunk)
-
-llm = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
-    openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-    model_name=MODEL_NAME, temperature=0.0, max_tokens=1000)
-
-print(f"Calling factify...")
-
-print(f"Calling factify with prompt: {prompt}")
-print(f"Token count: {compute_token_count(prompt)}")
-print(f"There are {len(docs)} chunks in the document.")
-
-result = llm(prompt)
-
-# TODO: implement a similar mechanism for caching results from
-# LLM calls given the expense of doing these calls. Make sure
-# to persist the cache to disk.
-facts, context = extract_facts_and_context_from_result(result)
-
-str_facts = "- " + str.join("\n- ", facts)
-print(f"Facts:\n{str_facts}")
-print(f"Context:\n{context}")
 
 question_template = PromptTemplate(
     input_variables=["facts", "context"],
@@ -200,9 +182,111 @@ question_template = PromptTemplate(
     )
 )
 
-question_prompt = question_template.format(facts=facts, context=context)
-print(f"Calling question generator with prompt:\n{question_prompt}")
+def process_document(document: Document, 
+                     llm: BaseLLM, 
+                     splitter: TextSplitter, 
+                     embedding_model: Embeddings, 
+                     cache: dict) -> list[Document]:
+    
+    # TODO: need to dynamically split a document based on token size limit
+    # for LLM and the increasing size of the context. Also the context
+    # seems to be repeated quite a bit as well - need some language to
+    # constrain how it summarizes into the context.
+    # General strategy:
+    # Split into smaller chunks and then assemble those chunks until we
+    # reach a token size limit that is a constraint that we precalc using 
+    # the known size of the context. What we don't know is the size of the
+    # response, so that needs to be constrained over time. 
+    # From docs:
+    # There is a CharacterTextSplitter.from_tiktoken_encoder that can be used
+    # to split text into chunks of a fixed size chunk_size is now in units
+    # of tokens. But the challenge here is that we need to have different 
+    # sized chunks over time.
+    docs = splitter.split_documents(document)
+    context = DEFAULT_CONTEXT
+    for doc in docs:
+        chunk = doc.page_content
+        chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
+        if chunk_hash in cache:
+            print(f"Cache hit for {chunk_hash}")
+            doc.metadata = cache[chunk_hash]
+            context = doc.metadata["context"]
+        else:
+            print(f"Cache miss for {chunk_hash}")
+            factify_prompt = factify_template.format(context=context, 
+                                                     chunk=chunk)
+            print(f"Calling LLM with prompt:\n{factify_prompt}")
+            result = llm(factify_prompt)
+            facts, new_context = extract_facts_and_context_from_result(result)
 
-result = llm(question_prompt)
-questions = json.loads(result)
-print(f"Questions:\n{questions}")
+            print(f"Extracted facts: {facts}")
+            doc.metadata["facts"] = facts
+
+            print(f"Evaluating new context: {new_context}")
+            doc.metadata["context"] = new_context
+
+            question_prompt = question_template.format(facts=facts, 
+                                                       context=new_context)
+
+            print(f"Calling LLM with prompt:\n{question_prompt}")
+            result = llm(question_prompt)
+            questions = json.loads(result)["questions"]
+
+            print(f"Extracted questions: {questions}")
+            doc.metadata["questions"] = questions
+
+            question_embeddings = embedding_model.embed_documents(questions)
+            fact_embeddings = embedding_model.embed_documents(facts)
+
+            doc.metadata["question_embeddings"] = question_embeddings
+            doc.metadata["fact_embeddings"] = fact_embeddings
+
+            cache[chunk_hash] = doc.metadata
+            context = new_context
+    return docs
+
+llm_model = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
+    openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
+    model_name=LLM_MODEL, temperature=0.0, max_tokens=1000)
+
+embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+cache = {}
+if os.path.exists("cache.pkl"):
+    with open("cache.pkl", "rb") as f:
+        cache = pickle.load(f)
+
+loader = TextLoader("ch1.txt")
+doc = loader.load()
+splitter = TokenTextSplitter.from_tiktoken_encoder(encoding_name=LLM_MODEL, chunk_size=1000)
+# splitter = NLTKTextSplitter(chunk_size=8000)
+
+docs = process_document(doc, llm_model, splitter, embedding_model, cache)
+
+# TODO: add to FAISS
+
+with open("cache.pkl", "wb") as f:
+    pickle.dump(cache, f)
+
+# A function that, given a document, extracts statistics from it and displays
+# a simple summary using the textual library.
+def summarize_document(document: Document, splitter: TextSplitter) -> None:
+    docs = splitter.split_documents(document)
+    for doc in docs:
+        print(f"Page {doc.page_number}: {doc.page_content[:100]}...")
+
+        if "facts" in doc.metadata:
+            print(f"Facts: {doc.metadata['facts']}")
+
+        if "questions" in doc.metadata:
+            print(f"Questions: {doc.metadata['questions']}")
+
+        print()
+
+class DocumentProcessing(App):
+    """A Textual app for processing documents for question answer."""
+    pass
+
+if __name__ == "__main__":
+    app = DocumentProcessing()
+    app.run()
