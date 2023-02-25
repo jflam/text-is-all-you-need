@@ -19,30 +19,41 @@ factify_template = PromptTemplate(
 
         Context: 
         
-        The conversation so far has covered the backround of the speaker. He
-        is in sales at UiPath.
+        This is the start of the document.
 
         Chunk:
 
-        We had a client where they would, they had like a huge database legacy
-        database of like their inventory in the store. Whenever they would
-        whenever they would do any type of like inventory accounts, they would
-        shut down for like eight hours but they wouldn't go in there and see
-        the differences between like the database and it will take them 16
-        hours to do. Yes, insane. We built a bot that will go in there and do
-        like we like to call it, auditing and reconciliation of all the
-        inventories, as long as they gave us like a spreadsheet, and you could
-        do it in an hour.
+        CHAPTER 1: THE LADDER There is a great deal of human nature in people.
+
+        - Mark Twain  THE TUG-OF-WAR IN OUR HEADS The animal world is a
+        stressful place to be.
+
+        The issue is that the animal world isn't really an animal world—it's a
+        world of trillions of strands of genetic information, each one
+        hell-bent on immortality.
+
+        Most gene strands don't last very long, and those still on Earth today
+        are the miracle outliers, such incredible survival specialists that
+        they're hundreds of millions of years old and counting.
+
+        Animals are just a hack these outlier genes came up with—temporary
+        containers designed to carry the genes and help them stay immortal.
+
+        Genes can't talk to their animals, so they control them by having them
+        run on specialized survival software I call the Primitive Mind:   The
+        Primitive Mind is a set of coded instructions for how to be a
+        successful animal in the animal's natural habitat.
 
         {{
             "facts": [
-                "A client had a large legacy database for inventory in their store.",
-                "The inventory reconciliation process would shut down the store for 8 hours.",
-                "The process of reconciling the database would take 16 hours to complete.",
-                "A bot was built to perform inventory auditing and reconciliation.",
-                "The bot can complete the process in an hour as long as a spreadsheet is provided.",
+                "There is a great deal of human nature in people.",
+                "The animal world is a stressful place.",
+                "The animal world is made up of trillions of strands of genetic information.",
+                "Most gene strands don't last very long.",
+                "Animals are temporary containers designed to carry the genes.",
+                "The Primitive Mind is a set of coded instructions for how to be a successful animal in the animal's natural habitat."
             ],
-            "new_context": "An RPA developer talks about a bot he made. The bot was created to reconcile a client's inventory database which used to take 16 hours to complete and shut down the store for 8 hours, and can now be done in an hour."
+            "new_context": "The document discusses the Primitive Mind, a set of coded instructions for how to be a successful animal in the animal's natural habitat. It is part of a larger discussion about the animal world, which is made up of trillions of strands of genetic information, and the great deal of human nature in people."
         }}
 
         Now the real one:
@@ -54,6 +65,36 @@ factify_template = PromptTemplate(
         {chunk}
 
         Only return JSON in your response based on the example above.
+        """
+    )
+)
+
+question_template = PromptTemplate(
+    input_variables=["facts", "context"],
+    template_format="jinja2",
+    template=dedent(
+        """ 
+        The context below is a summary of a section of a document. Below the
+        summary is a list of facts. For each fact, create a question that is
+        answered by the fact using the context to inform your answer. Do not
+        mention the context in your questions.
+
+        Context: 
+        {{ context }}
+
+        Facts:
+        {% for fact in facts %}
+        Fact {{ loop.index }}: {{ fact }}
+        {% endfor %}
+
+        Return your answer encoded in JSON:
+        {
+            "questions": [
+                "Question for Fact 1",
+                "Question for Fact 2",
+                ...
+            ]
+        }
         """
     )
 )

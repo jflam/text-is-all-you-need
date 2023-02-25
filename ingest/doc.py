@@ -1,12 +1,15 @@
+from ast import Tuple
+from typing import Any
 from langchain.document_loaders import TextLoader
 from langchain.text_splitter import NLTKTextSplitter, TextSplitter
 from langchain.llms import AzureOpenAI
+from langchain.llms.base import BaseLLM
 from langchain.embeddings import HuggingFaceEmbeddings
 from textual.app import App, ComposeResult
 from textual.message import Message
 from textual.widgets import TextLog, Header, Footer, DirectoryTree, Static
 from tiktoken import encoding_for_model, Encoding
-from factify import factify_template
+from factify import factify_template, question_template
 import asyncio, hashlib, json, openai, os, pickle
 
 ENVIRONMENT="EAST_AZURE_OPENAI"
@@ -22,6 +25,7 @@ TEMPERATURE = 0
 RESPONSE_TOKEN_LIMIT = 1000
 CACHE_FILENAME = "cache.pkl"
 ERROR_FILENAME = "errors.txt"
+LOG_FILENAME = "log.txt"
 
 DEFAULT_CONTEXT = "This is the start of the document."
 
@@ -29,7 +33,7 @@ embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 splitter = NLTKTextSplitter(chunk_size=4000)
 tokenizer = encoding_for_model(LLM_MODEL)
 
-def load_file(filename: str) -> str:
+def load_file(filename: str) -> Tuple(str, int):
     """Loads filename and returns the content and token count."""
     loader = TextLoader(filename)
     doc = loader.load()
@@ -58,13 +62,31 @@ def dump_error(e: Exception, message: str) -> None:
         file.write(f"Error: {e}\n\n")
         file.write(f"{message}\n\n")
 
-async def process_document(filename: str, text_log: TextLog, 
-                           cache: dict) -> None:
-    text_log.clear()
-    text_log.write(f"Processing: [bold yellow]{filename}[/]")
-    content, tokens = load_file(filename)
-    chunks, tokens = split_document(content, splitter, tokenizer)
-    text_log.write(f"Document has [bold yellow]{tokens}[/] tokens.")
+def dump_output(message: str) -> None:
+    with open(LOG_FILENAME, "a") as file:
+        file.write(f"{message}\n\n")
+
+async def call_llm(llm: BaseLLM, prompt: str, text_log: TextLog) -> Any:
+    """Async call the LLM and return the response as stripped string."""
+    try:
+        result = await llm.agenerate([prompt])
+        return result.generations[0][0].text.strip()
+    except openai.error.InvalidRequestError as e:
+        text_log.write(f"[red]InvalidRequestError: {e}[/]")
+        dump_error(e, prompt)
+        return None
+
+def json_to_obj(response: str, text_log: TextLog) -> Any:
+    """Parse the response as JSON and return object."""
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError as e:
+        text_log.write(f"[red]JSONDecodeError on: {e}[/]")
+        dump_error(e, response)
+        return None
+
+def log_chunks(chunks: list[str], tokens: list[int], text_log: TextLog) -> None:
+    """Log the last 40 characters of each chunk."""
     text_log.write(f"I have split the document into "
                    f"[bold yellow]{len(chunks)}[/] chunks.")
     text_log.write("Last 40 characters of each chunk prefixed by character "
@@ -73,6 +95,15 @@ async def process_document(filename: str, text_log: TextLog,
         trimmed = " ".join(chunk[-40:].splitlines())
         text_log.write(f"{i+1} [{len(chunk)}][{tokens[i]}]: "
                             f"[green]... {trimmed}[/]")
+
+async def process_document(filename: str, text_log: TextLog, 
+                           cache: dict) -> None:
+    text_log.clear()
+    text_log.write(f"Processing: [bold yellow]{filename}[/]")
+    content, token_count = load_file(filename)
+    text_log.write(f"Document has [bold yellow]{token_count}[/] tokens.")
+    chunks, tokens = split_document(content, splitter, tokenizer)
+    log_chunks(chunks, tokens, text_log)
 
     llm_model = get_llm()
     context = DEFAULT_CONTEXT
@@ -88,32 +119,34 @@ async def process_document(filename: str, text_log: TextLog,
             metadata = {}
             text_log.write(f"Sending chunk {i+1} to LLM...")
             factify_prompt = factify_template.format(context=context, chunk=chunk)
-
-            try:
-                response = await llm_model.agenerate([factify_prompt])
-            except openai.error.InvalidRequestError as e:
-                text_log.write(f"[red]InvalidRequestError: {e}[/]")
-                dump_error(e, factify_prompt)
+            text = await call_llm(llm_model, factify_prompt, text_log)
+            if text is None:
+                continue
+            obj = json_to_obj(text, text_log)
+            if obj is None:
                 continue
 
-            text = response.generations[0][0].text.strip()
-
-            try:
-                obj = json.loads(text)
-            except json.JSONDecodeError as e:
-                text_log.write(f"[red]JSONDecodeError on: {e}[/]")
-                dump_error(e, text)
-                continue
-
-            facts = obj["facts"]
-            new_context = obj["new_context"]
-            context = new_context
-            metadata["facts"] = facts
-            metadata["context"] = context
+            facts, context = obj["facts"], obj["new_context"]
+            metadata["facts"], metadata["context"] = facts, context
             cache[chunk_hash] = metadata
 
-        text_log.write("Facts extracted by the model:")
+        if "questions" in metadata:
+            questions = metadata["questions"]
+        else:
+            questions_prompt = question_template.format(context=context, 
+                                                        facts=facts)
+            text = await call_llm(llm_model, questions_prompt, text_log)
+            if text is None:
+                continue
+
+            obj = json_to_obj(text, text_log)
+
+            questions = obj["questions"]
+            metadata["questions"] = questions
+
+        text_log.write("Questions and Facts extracted by the model:")
         for i, fact in enumerate(facts):
+            text_log.write(f"Question {i+1}: [green]{questions[i]}[/]")
             text_log.write(f"Fact {i+1}: [green]{fact}[/]")
         text_log.write(f"New context: [green]{context}[/]")
 
@@ -134,6 +167,8 @@ class DocumentProcessingApp(App):
                 self.cache = pickle.load(file)
         if os.path.exists(ERROR_FILENAME):
             os.remove(ERROR_FILENAME)
+        if os.path.exists(LOG_FILENAME):
+            os.remove(LOG_FILENAME)
 
     def compose(self) -> ComposeResult:
         yield Header()
