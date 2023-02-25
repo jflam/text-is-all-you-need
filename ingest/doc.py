@@ -7,7 +7,7 @@ from textual.message import Message
 from textual.widgets import TextLog, Header, Footer, DirectoryTree, Static
 from tiktoken import encoding_for_model, Encoding
 from factify import factify_template
-import asyncio, json, openai, os
+import asyncio, hashlib, json, openai, os, pickle
 
 ENVIRONMENT="EAST_AZURE_OPENAI"
 openai.api_base = os.environ[f"{ENVIRONMENT}_ENDPOINT"]
@@ -20,6 +20,8 @@ LLM_MODEL = "text-davinci-003"
 MAX_TOKENS = 4096
 TEMPERATURE = 0
 RESPONSE_TOKEN_LIMIT = 1000
+CACHE_FILENAME = "cache.pkl"
+ERROR_FILENAME = "errors.txt"
 
 DEFAULT_CONTEXT = "This is the start of the document."
 
@@ -52,11 +54,12 @@ def get_llm() -> AzureOpenAI:
         max_tokens=RESPONSE_TOKEN_LIMIT)
 
 def dump_error(e: Exception, message: str) -> None:
-    with open("error.txt", "w") as file:
+    with open(ERROR_FILENAME, "a") as file:
         file.write(f"Error: {e}\n\n")
-        file.write(message)
+        file.write(f"{message}\n\n")
 
-async def process_document(filename: str, text_log: TextLog) -> None:
+async def process_document(filename: str, text_log: TextLog, 
+                           cache: dict) -> None:
     text_log.clear()
     text_log.write(f"Processing: [bold yellow]{filename}[/]")
     content, tokens = load_file(filename)
@@ -75,32 +78,44 @@ async def process_document(filename: str, text_log: TextLog) -> None:
     context = DEFAULT_CONTEXT
     for i in range(4):
         chunk = chunks[i]
-        text_log.write(f"Sending chunk {i+1} to LLM...")
-        factify_prompt = factify_template.format(context=context, chunk=chunk)
+        chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
+        if chunk_hash in cache:
+            text_log.write(f"Cache hit for chunk {i+1}!")
+            metadata = cache[chunk_hash]
+            context = metadata["context"]
+            facts = metadata["facts"]
+        else:
+            metadata = {}
+            text_log.write(f"Sending chunk {i+1} to LLM...")
+            factify_prompt = factify_template.format(context=context, chunk=chunk)
 
-        try:
-            response = await llm_model.agenerate([factify_prompt])
-        except openai.error.InvalidRequestError as e:
-            text_log.write(f"[red]InvalidRequestError: {e}[/]")
-            dump_error(e, factify_prompt)
-            continue
+            try:
+                response = await llm_model.agenerate([factify_prompt])
+            except openai.error.InvalidRequestError as e:
+                text_log.write(f"[red]InvalidRequestError: {e}[/]")
+                dump_error(e, factify_prompt)
+                continue
 
-        text = response.generations[0][0].text.strip()
+            text = response.generations[0][0].text.strip()
 
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError as e:
-            text_log.write(f"[red]JSONDecodeError on: {e}[/]")
-            dump_error(e, text)
-            continue
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError as e:
+                text_log.write(f"[red]JSONDecodeError on: {e}[/]")
+                dump_error(e, text)
+                continue
 
-        facts = obj["facts"]
-        new_context = obj["new_context"]
+            facts = obj["facts"]
+            new_context = obj["new_context"]
+            context = new_context
+            metadata["facts"] = facts
+            metadata["context"] = context
+            cache[chunk_hash] = metadata
+
         text_log.write("Facts extracted by the model:")
         for i, fact in enumerate(facts):
             text_log.write(f"Fact {i+1}: [green]{fact}[/]")
-        text_log.write(f"New context: [green]{new_context}[/]")
-        context = new_context
+        text_log.write(f"New context: [green]{context}[/]")
 
 class DocumentProcessingApp(App):
     BINDINGS = [
@@ -111,10 +126,20 @@ class DocumentProcessingApp(App):
     SUB_TITLE = "Import a document into question answer database"
     CSS_PATH = "doc.css"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.cache = {}
+        if os.path.exists(CACHE_FILENAME):
+            with open(CACHE_FILENAME, "rb") as file:
+                self.cache = pickle.load(file)
+        if os.path.exists(ERROR_FILENAME):
+            os.remove(ERROR_FILENAME)
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield DirectoryTree(path=".", classes="box")
-        yield TextLog(highlight=True, markup=True, wrap=True, classes="box", id="log")
+        yield TextLog(highlight=True, markup=True, wrap=True, classes="box", 
+                      id="log")
         yield Static("Bob", classes="box")
         yield Footer()
     
@@ -122,11 +147,13 @@ class DocumentProcessingApp(App):
         self.dark = not self.dark
 
     def action_quit(self) -> None:
+        with open(CACHE_FILENAME, "wb") as file:
+            pickle.dump(self.cache, file)
         self.exit()
 
     async def on_directory_tree_file_selected(self, msg: Message) -> None:
         text_log = self.query_one("#log", TextLog)
-        asyncio.create_task(process_document(msg.path, text_log))
+        asyncio.create_task(process_document(msg.path, text_log, self.cache))
 
 if __name__ == "__main__":
     app = DocumentProcessingApp()
