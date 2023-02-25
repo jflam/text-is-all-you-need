@@ -54,7 +54,7 @@ def split_document(content: str,
 def get_llm() -> AzureOpenAI:
     return AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
         openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-        model_name=LLM_MODEL, temperature=0.0,
+        model_name=LLM_MODEL, temperature=TEMPERATURE,
         max_tokens=RESPONSE_TOKEN_LIMIT)
 
 def dump_error(e: Exception, message: str) -> None:
