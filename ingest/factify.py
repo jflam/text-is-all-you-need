@@ -6,8 +6,8 @@ factify_template = PromptTemplate(
     template=dedent(
         """ 
         Your task is to take the context of document and a chunk of text, and
-        extract any pertinent facts from it. The facts should only cover new
-        information introduced in the chunk. The context is only for
+        extract up to ten pertinent facts from it. The facts should only cover
+        new information introduced in the chunk. The context is only for
         background; do not use it to generate facts.
 
         You will also generate a new context, by taking the old context and
@@ -41,7 +41,7 @@ factify_template = PromptTemplate(
                 "The process of reconciling the database would take 16 hours to complete.",
                 "A bot was built to perform inventory auditing and reconciliation.",
                 "The bot can complete the process in an hour as long as a spreadsheet is provided.",
-            ]
+            ],
             "new_context": "An RPA developer talks about a bot he made. The bot was created to reconcile a client's inventory database which used to take 16 hours to complete and shut down the store for 8 hours, and can now be done in an hour."
         }}
 

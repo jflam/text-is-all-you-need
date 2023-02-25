@@ -18,12 +18,10 @@ DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
 EMBEDDING_MODEL = "sentence-transformers/gtr-t5-large"
 LLM_MODEL = "text-davinci-003"
 MAX_TOKENS = 4096
+TEMPERATURE = 0
+RESPONSE_TOKEN_LIMIT = 1000
 
 DEFAULT_CONTEXT = "This is the start of the document."
-
-llm_model = AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
-    openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-    model_name=LLM_MODEL, temperature=0.0, max_tokens=1000)
 
 embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 splitter = NLTKTextSplitter(chunk_size=4000)
@@ -47,29 +45,55 @@ def split_document(content: str,
     tokens = [len(tokenizer.encode(chunk)) for chunk in chunks]
     return chunks, tokens
 
+def get_llm() -> AzureOpenAI:
+    return AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
+        openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
+        model_name=LLM_MODEL, temperature=0.0,
+        max_tokens=RESPONSE_TOKEN_LIMIT)
+
+def dump_error(e: Exception, message: str) -> None:
+    with open("error.txt", "w") as file:
+        file.write(f"Error: {e}\n\n")
+        file.write(message)
+
 async def process_document(filename: str, text_log: TextLog) -> None:
     text_log.clear()
     text_log.write(f"Processing: [bold yellow]{filename}[/]")
     content, tokens = load_file(filename)
     chunks, tokens = split_document(content, splitter, tokenizer)
     text_log.write(f"Document has [bold yellow]{tokens}[/] tokens.")
-    text_log.write(f"I have split the document into [bold yellow]{len(chunks)}[/] chunks.")
-    text_log.write("Last 40 characters of each chunk prefixed by character count and token count:")
+    text_log.write(f"I have split the document into "
+                   f"[bold yellow]{len(chunks)}[/] chunks.")
+    text_log.write("Last 40 characters of each chunk prefixed by character "
+                   "count and token count:")
     for i, chunk in enumerate(chunks):
         trimmed = " ".join(chunk[-40:].splitlines())
         text_log.write(f"{i+1} [{len(chunk)}][{tokens[i]}]: "
                             f"[green]... {trimmed}[/]")
 
+    llm_model = get_llm()
     context = DEFAULT_CONTEXT
-    for i in range(2):
+    for i in range(4):
         chunk = chunks[i]
         text_log.write(f"Sending chunk {i+1} to LLM...")
-
         factify_prompt = factify_template.format(context=context, chunk=chunk)
-        response = await llm_model.agenerate([factify_prompt])
+
+        try:
+            response = await llm_model.agenerate([factify_prompt])
+        except openai.error.InvalidRequestError as e:
+            text_log.write(f"[red]InvalidRequestError: {e}[/]")
+            dump_error(e, factify_prompt)
+            continue
+
         text = response.generations[0][0].text.strip()
-        text_log.write(f"Raw response: {text}")
-        obj = json.loads(text)
+
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError as e:
+            text_log.write(f"[red]JSONDecodeError on: {e}[/]")
+            dump_error(e, text)
+            continue
+
         facts = obj["facts"]
         new_context = obj["new_context"]
         text_log.write("Facts extracted by the model:")
