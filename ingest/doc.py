@@ -29,7 +29,8 @@ LOG_FILENAME = "log.txt"
 
 DEFAULT_CONTEXT = "This is the start of the document."
 
-embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+# TODO: delay load this when needed!
+# embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 splitter = NLTKTextSplitter(chunk_size=4000)
 tokenizer = encoding_for_model(LLM_MODEL)
 
