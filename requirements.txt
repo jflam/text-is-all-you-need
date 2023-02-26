@@ -1,3 +1,4 @@
+bs4
 faiss-cpu
 langchain>=0.0.70
 modal-client
@@ -8,6 +9,7 @@ pypdf2
 qdrant-client==0.11.9
 sentence_transformers
 textual[dev]
+tiktoken
 transformers[torch]
 streamlit
 streamlit-chat
