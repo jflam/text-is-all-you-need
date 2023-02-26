@@ -79,6 +79,9 @@ async def call_llm(llm: BaseLLM, prompt: str, text_log: TextLog) -> Any:
 def json_to_obj(response: str, text_log: TextLog) -> Any:
     """Parse the response as JSON and return object."""
     try:
+        # TODO: can't just blindly parse this. I probably need to think
+        # about how to handle escaping quotes in the response. Actually
+        # it's probably better to strip quotes from the REQUEST!
         return json.loads(response)
     except json.JSONDecodeError as e:
         text_log.write(f"[red]JSONDecodeError on: {e}[/]")
@@ -107,7 +110,7 @@ async def process_document(filename: str, text_log: TextLog,
 
     llm_model = get_llm()
     context = DEFAULT_CONTEXT
-    for i in range(4):
+    for i in range(len(chunks)):
         chunk = chunks[i]
         chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
         if chunk_hash in cache:
