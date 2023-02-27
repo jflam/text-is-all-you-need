@@ -10,6 +10,7 @@ from textual.message import Message
 from textual.widgets import TextLog, Header, Footer, DirectoryTree, Static
 from tiktoken import encoding_for_model, Encoding
 from factify import factify_template, question_template
+from nltk.tokenize.punkt import PunktSentenceTokenizer
 import asyncio, hashlib, json, openai, os, pickle
 
 ENVIRONMENT="EAST_AZURE_OPENAI"
@@ -22,17 +23,23 @@ EMBEDDING_MODEL = "sentence-transformers/gtr-t5-large"
 LLM_MODEL = "text-davinci-003"
 MAX_TOKENS = 4096
 TEMPERATURE = 0
-RESPONSE_TOKEN_LIMIT = 1000
 CACHE_FILENAME = "cache.pkl"
 ERROR_FILENAME = "errors.txt"
 LOG_FILENAME = "log.txt"
+
+# These parameters are used to manage the LLM token window
+MAX_CONTEXT = 1000
+RESPONSE_TOKEN_LIMIT = 2000
+CHUNK_SIZE = 2500
 
 DEFAULT_CONTEXT = "This is the start of the document."
 
 # TODO: delay load this when needed!
 # embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-splitter = NLTKTextSplitter(chunk_size=4000)
-tokenizer = encoding_for_model(LLM_MODEL)
+splitter = NLTKTextSplitter(chunk_size=CHUNK_SIZE)
+
+# TODO: add UI to toggle this
+COST_MONITORING = False
 
 def load_file(filename: str) -> Tuple(str, int):
     """Loads filename and returns the content and token count."""
@@ -45,18 +52,15 @@ def load_file(filename: str) -> Tuple(str, int):
     return content, len(tokens)
 
 def split_document(content: str,
-                   splitter: TextSplitter,
-                   tokenizer: Encoding):
+                   splitter: TextSplitter) -> Tuple(list[str], list[int]):
     """Split content into chunks and return the chunks and token counts. """
     chunks = splitter.split_text(content)
-    tokens = [len(tokenizer.encode(chunk)) for chunk in chunks]
+    if COST_MONITORING:
+        tokenizer = encoding_for_model(LLM_MODEL)
+        tokens = [len(tokenizer.encode(chunk)) for chunk in chunks]
+    else:
+        tokens = [0] * len(chunks)
     return chunks, tokens
-
-def get_llm() -> AzureOpenAI:
-    return AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
-        openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-        model_name=LLM_MODEL, temperature=TEMPERATURE,
-        max_tokens=RESPONSE_TOKEN_LIMIT)
 
 def dump_error(e: Exception, message: str) -> None:
     with open(ERROR_FILENAME, "a") as file:
@@ -67,7 +71,15 @@ def dump_output(message: str) -> None:
     with open(LOG_FILENAME, "a") as file:
         file.write(f"{message}\n\n")
 
-async def call_llm(llm: BaseLLM, prompt: str, text_log: TextLog) -> Any:
+def get_llm(max_tokens: int = RESPONSE_TOKEN_LIMIT) -> AzureOpenAI:
+    return AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
+        openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
+        model_name=LLM_MODEL, temperature=TEMPERATURE,
+        max_tokens=max_tokens)
+
+async def call_llm(llm: BaseLLM, 
+                   prompt: str, 
+                   text_log: TextLog) -> Any:
     """Async call the LLM and return the response as stripped string."""
     try:
         result = await llm.agenerate([prompt])
@@ -77,12 +89,30 @@ async def call_llm(llm: BaseLLM, prompt: str, text_log: TextLog) -> Any:
         dump_error(e, prompt)
         return None
 
+def extract_questions(response: str) -> list[str]:
+    questions = []
+    for line in response.splitlines():
+        if line.startswith("Q:"):
+            questions.append(line[2:].strip())
+    return questions
+
+def extract_facts_and_context(response: str) -> list[str]:
+    facts = []
+    context = []
+    context_mode = False
+    for line in response.splitlines():
+        if line.startswith("New Context:"):
+            context_mode = True
+        if context_mode:
+            context.append(line)
+        elif line.startswith("F:"):
+            facts.append(line[2:].strip())
+
+    return facts, " ".join(context)
+
 def json_to_obj(response: str, text_log: TextLog) -> Any:
     """Parse the response as JSON and return object."""
     try:
-        # TODO: can't just blindly parse this. I probably need to think
-        # about how to handle escaping quotes in the response. Actually
-        # it's probably better to strip quotes from the REQUEST!
         return json.loads(response)
     except json.JSONDecodeError as e:
         text_log.write(f"[red]JSONDecodeError on: {e}[/]")
@@ -100,60 +130,104 @@ def log_chunks(chunks: list[str], tokens: list[int], text_log: TextLog) -> None:
         text_log.write(f"{i+1} [{len(chunk)}][{tokens[i]}]: "
                             f"[green]... {trimmed}[/]")
 
+def strip_sentences(text: str, limit: int = MAX_CONTEXT) -> str:
+    """Strip sentences from text until it is less than limit."""
+    tokenizer = PunktSentenceTokenizer()
+    sentences = tokenizer.tokenize(text)
+    while len(text) > limit:
+        text = " ".join(sentences[:-1])
+        sentences = tokenizer.tokenize(text)
+    return text
+
 async def process_document(filename: str, text_log: TextLog, 
                            cache: dict) -> None:
     text_log.clear()
     text_log.write(f"Processing: [bold yellow]{filename}[/]")
     content, token_count = load_file(filename)
     text_log.write(f"Document has [bold yellow]{token_count}[/] tokens.")
-    chunks, tokens = split_document(content, splitter, tokenizer)
+    chunks, tokens = split_document(content, splitter)
     log_chunks(chunks, tokens, text_log)
 
-    llm_model = get_llm()
+    factify_model = get_llm()
+    questions_model = get_llm()
     context = DEFAULT_CONTEXT
     for i in range(len(chunks)):
-        chunk = chunks[i]
-        chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
-        if chunk_hash in cache:
-            text_log.write(f"Cache hit for chunk {i+1}!")
-            metadata = cache[chunk_hash]
-            context = metadata["context"]
-            facts = metadata["facts"]
-        else:
-            metadata = {}
-            text_log.write(f"Sending chunk {i+1} to LLM...")
-            factify_prompt = factify_template.format(context=context, chunk=chunk)
-            text = await call_llm(llm_model, factify_prompt, text_log)
-            if text is None:
-                continue
-            obj = json_to_obj(text, text_log)
-            if obj is None:
-                continue
+        try:
+            chunk = chunks[i]
+            chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
+            if chunk_hash in cache:
+                text_log.write(f"Cache hit for chunk {i+1}!")
+                metadata = cache[chunk_hash]
+                context = metadata["context"]
+                facts = metadata["facts"]
+            else:
+                metadata = {}
+                text_log.write(f"Sending chunk {i+1} to LLM...")
+                factify_prompt = factify_template.format(context=context, 
+                                                         chunk=chunk)
+                text = await call_llm(factify_model, factify_prompt, text_log)
+                if text is None:
+                    continue
+                dump_output("FACTIFY MODEL OUTPUT")
+                dump_output(text)
+                dump_output("==============================")
+                facts, context = extract_facts_and_context(text)
 
-            facts, context = obj["facts"], obj["new_context"]
+            context = strip_sentences(context)
             metadata["facts"], metadata["context"] = facts, context
             cache[chunk_hash] = metadata
 
-        if "questions" in metadata:
-            questions = metadata["questions"]
+            if "questions" in metadata:
+                facts = metadata["facts"]
+                questions = metadata["questions"]
+                assert len(facts) == len(questions)
+            else:
+                questions_prompt = question_template.format(context=context, 
+                                                            facts=facts)
+
+                text = await call_llm(questions_model, 
+                                      questions_prompt, 
+                                      text_log)
+                dump_output("QUESTIONS MODEL OUTPUT")
+                dump_output(text)
+                dump_output("==============================")
+                if text is None:
+                    continue
+
+                questions = extract_questions(text)
+                if questions is None:
+                    continue
+
+                metadata["questions"] = questions
+
+            assert len(facts) == len(questions)
+            text_log.write("Questions and Facts extracted by the model:")
+            for i in range(len(questions)):
+                text_log.write(f"Question {i+1}: [green]{questions[i]}[/]")
+                text_log.write(f"Fact {i+1}: [green]{facts[i]}[/]")
+            text_log.write(f"New context: [green]{context}[/]")
+        except BaseException as e:
+            text_log.write(f"[red]Exception Name: {type(e)}[/]")
+            text_log.write(f"[red]Exception Message: {e}[/]")
+    text_log.write("[bold yellow]Done![/]")
+
+def dump_questions_and_answers(path: str, text_log: TextLog) -> None:
+    with open(path, "rb") as file:
+        cache = pickle.load(file)
+
+    for key in cache:
+        metadata = cache[key]
+        facts = metadata["facts"]
+        questions = metadata["questions"]
+        context = metadata["context"]
+
+        text_log.write(f"Context\n:{context}")
+        if len(facts) == len(questions):
+            for i in range(len(questions)):
+                text_log.write(f"Question {i+1}: [green]{questions[i]}[/]")
+                text_log.write(f"Fact {i+1}: [green]{facts[i]}[/]")
         else:
-            questions_prompt = question_template.format(context=context, 
-                                                        facts=facts)
-            text = await call_llm(llm_model, questions_prompt, text_log)
-            if text is None:
-                continue
-
-            obj = json_to_obj(text, text_log)
-
-            questions = obj["questions"]
-            metadata["questions"] = questions
-
-        text_log.write("Questions and Facts extracted by the model:")
-        for i, fact in enumerate(facts):
-            text_log.write(f"Question {i+1}: [green]{questions[i]}[/]")
-            text_log.write(f"Fact {i+1}: [green]{fact}[/]")
-        text_log.write(f"New context: [green]{context}[/]")
-
+            text_log.write(f"[red]Mismatch in facts and questions for chunk[/]")
 class DocumentProcessingApp(App):
     BINDINGS = [
         ("d", "toggle_dark", "Toggle dark mode"),
@@ -192,7 +266,11 @@ class DocumentProcessingApp(App):
 
     async def on_directory_tree_file_selected(self, msg: Message) -> None:
         text_log = self.query_one("#log", TextLog)
-        asyncio.create_task(process_document(msg.path, text_log, self.cache))
+        path = msg.path
+        if path.endswith(".pkl"):
+            dump_questions_and_answers(path, text_log)
+        else:
+            asyncio.create_task(process_document(path, text_log, self.cache))
 
 if __name__ == "__main__":
     app = DocumentProcessingApp()
