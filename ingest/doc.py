@@ -1,26 +1,31 @@
 from ast import Tuple
-from typing import Any
 from langchain.document_loaders import TextLoader
 from langchain.text_splitter import NLTKTextSplitter, TextSplitter
-from langchain.llms import AzureOpenAI
-from langchain.llms.base import BaseLLM
+from langchain.llms.base import LLM
+from langchain.llms import AzureOpenAI, OpenAIChat
 from langchain.embeddings import HuggingFaceEmbeddings
 from textual.app import App, ComposeResult
 from textual.message import Message
-from textual.widgets import TextLog, Header, Footer, DirectoryTree, Static
-from tiktoken import encoding_for_model, Encoding
-from factify import factify_template, question_template, one_pass_factify_template
+from textual.widgets import TextLog, Header, Footer, DirectoryTree
+from tiktoken import encoding_for_model
+from factify import one_pass_factify_template
 from nltk.tokenize.punkt import PunktSentenceTokenizer
-import asyncio, hashlib, json, openai, os, pickle
+import asyncio, hashlib, openai, os, pickle
 
-ENVIRONMENT="EAST_AZURE_OPENAI"
+# ENVIRONMENT="EAST_AZURE_OPENAI"
+ENVIRONMENT="OPENAI"
 openai.api_base = os.environ[f"{ENVIRONMENT}_ENDPOINT"]
-openai.api_type = "azure"
-openai.api_version = "2022-12-01"
-DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
+# openai.api_type = "azure"
+# openai.api_version = "2022-12-01"
+# DEPLOYMENT_ID = os.environ[f"{ENVIRONMENT}_DEPLOYMENT"]
 
 EMBEDDING_MODEL = "sentence-transformers/gtr-t5-large"
-LLM_MODEL = "text-davinci-003"
+# LLM_MODEL = "text-davinci-003"
+
+# The turbo model released 3/1/2023
+LLM_MODEL = "gpt-3.5-turbo"
+COST_PER_1K_TOKENS = 0.002 
+
 MAX_TOKENS = 4096
 TEMPERATURE = 0
 CACHE_FILENAME = "cache.pkl"
@@ -33,6 +38,22 @@ RESPONSE_TOKEN_LIMIT = 2000
 CHUNK_SIZE = 2500
 
 DEFAULT_CONTEXT = "This is the start of the document."
+
+class Cache:
+    """Stores CacheEntries and manages sequence"""
+    pass
+
+class CacheEntry:
+    """Cache entry for a chunk of text in a document."""
+    def __init__(self, 
+                 questions: list[str],
+                 facts: list[str],
+                 chunk: str,
+                 cost: int):
+        self.questions = questions # List of questions to be embedded
+        self.facts = facts # List of facts to be embedded
+        self.chunk = chunk # Chunk of text from document
+        self.cost = cost # Number of tokens it cost to generate this entry
 
 # TODO: delay load this when needed!
 # embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
@@ -71,46 +92,15 @@ def dump_output(message: str) -> None:
     with open(LOG_FILENAME, "a") as file:
         file.write(f"{message}\n\n")
 
-def get_llm(max_tokens: int = RESPONSE_TOKEN_LIMIT) -> AzureOpenAI:
-    return AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
-        openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
-        model_name=LLM_MODEL, temperature=TEMPERATURE,
-        max_tokens=-1) # TODO: check this value
-
-async def call_llm(llm: BaseLLM, 
-                   prompt: str, 
-                   text_log: TextLog) -> Any:
-    """Async call the LLM and return the response as stripped string."""
-    try:
-        result = await llm.agenerate([prompt])
-        return result.generations[0][0].text.strip()
-    except openai.error.InvalidRequestError as e:
-        text_log.write(f"[red]InvalidRequestError: {e}[/]")
-        dump_error(e, prompt)
-        return None
-
-def extract_questions(response: str) -> list[str]:
-    questions = []
-    for line in response.splitlines():
-        if line.startswith("Q:"):
-            questions.append(line[2:].strip())
-    return questions
-
-def extract_facts_and_context(response: str) -> list[str]:
-    facts = []
-    context = []
-    context_mode = False
-    for line in response.splitlines():
-        if line.startswith("New Context:"):
-            context.append(line[12:].strip())
-            context_mode = True
-        else:
-            if context_mode:
-                context.append(line)
-            elif line.startswith("F:"):
-                facts.append(line[2:].strip())
-
-    return facts, " ".join(context)
+def get_llm(max_tokens: int = RESPONSE_TOKEN_LIMIT) -> LLM:
+    return OpenAIChat(openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"], 
+                      temperature=TEMPERATURE,
+                      max_tokens=-1,
+                      model_name=LLM_MODEL)
+    # return AzureOpenAI(deployment_name=DEPLOYMENT_ID, 
+    #     openai_api_key=os.environ[f"{ENVIRONMENT}_API_KEY"],
+    #     model_name=LLM_MODEL, temperature=TEMPERATURE,
+    #     max_tokens=-1) # TODO: check this value
 
 def extract_facts_questions_and_context(response: str) -> list[str]:
     facts = []
@@ -130,15 +120,6 @@ def extract_facts_questions_and_context(response: str) -> list[str]:
                 questions.append(line[2:].strip())
 
     return facts, questions, " ".join(context)
-
-def json_to_obj(response: str, text_log: TextLog) -> Any:
-    """Parse the response as JSON and return object."""
-    try:
-        return json.loads(response)
-    except json.JSONDecodeError as e:
-        text_log.write(f"[red]JSONDecodeError on: {e}[/]")
-        dump_error(e, response)
-        return None
 
 def log_chunks(chunks: list[str], tokens: list[int], text_log: TextLog) -> None:
     """Log the last 40 characters of each chunk."""
@@ -160,44 +141,61 @@ def strip_sentences(text: str, limit: int = MAX_CONTEXT) -> str:
         sentences = tokenizer.tokenize(text)
     return text
 
-async def process_document_one_shot(filename: str, text_log: TextLog, 
-                           cache: dict) -> None:
+async def process_document_one_shot(filename: str, 
+                                    text_log: TextLog, 
+                                    stats_log: TextLog,
+                                    cache: dict) -> None:
     text_log.clear()
-    text_log.write(f"Processing: [bold yellow]{filename}[/]")
     content, token_count = load_file(filename)
-    text_log.write(f"Document has [bold yellow]{token_count}[/] tokens.")
+    stats_log.write(f"File [bold yellow]{filename}[/] has "
+                    f"[bold yellow]{token_count} tokens[/].")
     chunks, tokens = split_document(content, splitter)
-    log_chunks(chunks, tokens, text_log)
+    log_chunks(chunks, tokens, stats_log)
 
     factify_model = get_llm()
-    questions_model = get_llm()
     context = DEFAULT_CONTEXT
-    for i in range(len(chunks)):
+    cumulative_tokens = 0
+    chunk_count = 3
+    for i in range(chunk_count):
         try:
-            dump_output(f"Processing chunk {i+1}...")
+            chunk_id = f"{i+1}/{chunk_count}"
+            dump_output(f"Processing chunk {chunk_id}...")
             dump_output(f"Context: {context}")
             chunk = chunks[i]
             chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
             if chunk_hash in cache:
-                text_log.write(f"Cache hit for chunk {i+1}!")
+                text_log.write(f"Cache hit for chunk {chunk_id}!")
                 metadata = cache[chunk_hash]
                 context = metadata["context"]
                 facts = metadata["facts"]
                 questions = metadata["questions"]
             else:
                 metadata = {}
-                text_log.write(f"Sending chunk {i+1} to LLM...")
-                factify_prompt = one_pass_factify_template.format(context=context, 
-                                                         chunk=chunk)
-                dump_output("FACTIFY PROMPT")
+                text_log.write(f"Sending chunk {chunk_id} to LLM...")
+                factify_prompt = one_pass_factify_template.format(
+                    context=context, 
+                    chunk=chunk)
+                dump_output(">>> FACTIFY PROMPT")
                 dump_output(factify_prompt)
                 dump_output("==============================")
-                text = await call_llm(factify_model, factify_prompt, text_log)
-                if text is None:
+
+                try:
+                    result = await factify_model.agenerate([factify_prompt])
+                except openai.error.InvalidRequestError as e:
+                    text_log.write(f"[red]InvalidRequestError: {e}[/]")
+                    dump_error(e, factify_prompt)
                     continue
-                dump_output("FACTIFY MODEL OUTPUT")
+
+                text = result.generations[0][0].text.strip()
+                token_count = result.llm_output['token_usage']['total_tokens']
+                stats_log.write(f"Chunk {chunk_id} used "
+                                f"[bold yellow]{token_count} tokens")
+                cumulative_tokens += token_count
+
+                dump_output(">>> FACTIFY MODEL OUTPUT")
                 dump_output(text)
                 dump_output("==============================")
+
                 facts, questions, context = extract_facts_questions_and_context(text)
 
             context = strip_sentences(context)
@@ -215,86 +213,9 @@ async def process_document_one_shot(filename: str, text_log: TextLog,
             text_log.write(f"[red]Exception Name: {type(e)}[/]")
             text_log.write(f"[red]Exception Message: {e}[/]")
     text_log.write("[bold yellow]Done![/]")
-
-async def process_document(filename: str, text_log: TextLog, 
-                           cache: dict) -> None:
-    text_log.clear()
-    text_log.write(f"Processing: [bold yellow]{filename}[/]")
-    content, token_count = load_file(filename)
-    text_log.write(f"Document has [bold yellow]{token_count}[/] tokens.")
-    chunks, tokens = split_document(content, splitter)
-    log_chunks(chunks, tokens, text_log)
-
-    factify_model = get_llm()
-    questions_model = get_llm()
-    context = DEFAULT_CONTEXT
-    for i in range(len(chunks)):
-        try:
-            dump_output(f"Processing chunk {i+1}...")
-            dump_output(f"Context: {context}")
-            chunk = chunks[i]
-            chunk_hash = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:8]
-            if chunk_hash in cache:
-                text_log.write(f"Cache hit for chunk {i+1}!")
-                metadata = cache[chunk_hash]
-                context = metadata["context"]
-                facts = metadata["facts"]
-            else:
-                metadata = {}
-                text_log.write(f"Sending chunk {i+1} to LLM...")
-                factify_prompt = factify_template.format(context=context, 
-                                                         chunk=chunk)
-                dump_output("FACTIFY PROMPT")
-                dump_output(factify_prompt)
-                dump_output("==============================")
-                text = await call_llm(factify_model, factify_prompt, text_log)
-                if text is None:
-                    continue
-                dump_output("FACTIFY MODEL OUTPUT")
-                dump_output(text)
-                dump_output("==============================")
-                facts, context = extract_facts_and_context(text)
-
-            context = strip_sentences(context)
-            metadata["facts"], metadata["context"] = facts, context
-            cache[chunk_hash] = metadata
-
-            if "questions" in metadata:
-                facts = metadata["facts"]
-                questions = metadata["questions"]
-                assert len(facts) == len(questions)
-            else:
-                questions_prompt = question_template.format(context=context, 
-                                                            facts=facts)
-
-                dump_output("QUESTIONS PROMPT")
-                dump_output(questions_prompt)
-                dump_output("==============================")
-                text = await call_llm(questions_model, 
-                                      questions_prompt, 
-                                      text_log)
-                dump_output("QUESTIONS MODEL OUTPUT")
-                dump_output(text)
-                dump_output("==============================")
-                if text is None:
-                    continue
-
-                questions = extract_questions(text)
-                if questions is None:
-                    continue
-
-                metadata["questions"] = questions
-
-            assert len(facts) == len(questions)
-            text_log.write("Questions and Facts extracted by the model:")
-            for i in range(len(questions)):
-                text_log.write(f"Question {i+1}: [green]{questions[i]}[/]")
-                text_log.write(f"Fact {i+1}: [green]{facts[i]}[/]")
-            text_log.write(f"New context: [green]{context}[/]")
-        except BaseException as e:
-            text_log.write(f"[red]Exception Name: {type(e)}[/]")
-            text_log.write(f"[red]Exception Message: {e}[/]")
-    text_log.write("[bold yellow]Done![/]")
+    stats_log.write(f"Total tokens used: [bold yellow]{cumulative_tokens}[/]")
+    dollar_cost = cumulative_tokens / 1000.0 * COST_PER_1K_TOKENS
+    stats_log.write(f"Total Cost = $[bold yellow]{dollar_cost}[/]")
 
 def dump_questions_and_answers(path: str, text_log: TextLog) -> None:
     with open(path, "rb") as file:
@@ -338,7 +259,7 @@ class DocumentProcessingApp(App):
         yield DirectoryTree(path=".", classes="box")
         yield TextLog(highlight=True, markup=True, wrap=True, classes="box", 
                       id="log")
-        yield Static("Bob", classes="box")
+        yield TextLog(markup=True, wrap=True, id="stats", classes="box")
         yield Footer()
     
     def action_toggle_dark(self) -> None:
@@ -351,11 +272,15 @@ class DocumentProcessingApp(App):
 
     async def on_directory_tree_file_selected(self, msg: Message) -> None:
         text_log = self.query_one("#log", TextLog)
+        stats_log = self.query_one("#stats", TextLog)
         path = msg.path
         if path.endswith(".pkl"):
             dump_questions_and_answers(path, text_log)
         else:
-            asyncio.create_task(process_document_one_shot(path, text_log, self.cache))
+            asyncio.create_task(process_document_one_shot(path, 
+                                                          text_log, 
+                                                          stats_log, 
+                                                          self.cache))
 
 if __name__ == "__main__":
     app = DocumentProcessingApp()
